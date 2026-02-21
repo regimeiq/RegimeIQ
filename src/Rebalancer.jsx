@@ -67,14 +67,25 @@ function generateTargets(assets, btcConviction, goldConviction, riskProfile) {
   // SPX gets whatever is left
   if (hasSPX) {
     targets.SPX = remaining;
+    remaining = 0;
   } else if (hasGold && !goldConviction) {
     // Gold selected but somehow no conviction — fallback split
     targets.GOLD = remaining;
+    remaining = 0;
   }
 
   // Edge case: gold selected, no SPX, gold already allocated above
   if (!hasSPX && hasGold && goldConviction && remaining > 0) {
     targets.GOLD += remaining;
+    remaining = 0;
+  }
+
+  // Safety net: ensure allocations always sum to 100%.
+  if (remaining > 0) {
+    if (hasSPX) targets.SPX = (targets.SPX || 0) + remaining;
+    else if (hasGold) targets.GOLD = (targets.GOLD || 0) + remaining;
+    else if (hasBTC) targets.BTC = (targets.BTC || 0) + remaining;
+    else if (hasCash) targets.CASH = (targets.CASH || 0) + remaining;
   }
 
   return targets;

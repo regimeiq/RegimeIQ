@@ -2,8 +2,59 @@ var EODHD = process.env.EODHD_KEY;
 var AV_KEY = process.env.ALPHA_VANTAGE_KEY;
 var BTCLAB = process.env.BTCLAB_KEY;
 var CQ_KEY = process.env.CRYPTOQUANT_KEY;
-var UPSTREAM_TIMEOUT_MS = 8000;
+function readPositiveInt(name, fallback) {
+  var raw = process.env[name];
+  var n = parseInt(raw || "", 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+var UPSTREAM_TIMEOUT_MS = readPositiveInt("UPSTREAM_TIMEOUT_MS", 8000);
+var RATE_LIMIT_WINDOW_MS = readPositiveInt("RATE_LIMIT_WINDOW_MS", 60000);
+var RATE_LIMIT_MAX_REQUESTS = readPositiveInt("RATE_LIMIT_MAX_REQUESTS", 30);
+var MEMORY_CACHE_TTL_MS = readPositiveInt("MEMORY_CACHE_TTL_MS", 60000);
+var DEFAULT_ALLOWED_ORIGIN = "https://regimeiq.com";
+var state = globalThis.__REGIMEIQ_API_STATE__;
+if (!state) {
+  state = { hits: new Map(), cache: null, inflight: null };
+  globalThis.__REGIMEIQ_API_STATE__ = state;
+}
 function round2(n) { return Math.round(n * 100) / 100; }
+function errorMessage(err) { return err && err.message ? err.message : String(err || "Unknown error"); }
+function firstDefined() {
+  for (var i = 0; i < arguments.length; i++) {
+    if (arguments[i] !== undefined && arguments[i] !== null) return arguments[i];
+  }
+  return null;
+}
+
+function getClientIp(req) {
+  var xff = req.headers["x-forwarded-for"];
+  if (Array.isArray(xff) && xff.length > 0) xff = xff[0];
+  if (typeof xff === "string" && xff.trim()) return xff.split(",")[0].trim();
+  var realIp = req.headers["x-real-ip"];
+  if (typeof realIp === "string" && realIp.trim()) return realIp.trim();
+  return "unknown";
+}
+
+function pruneRateLimitState(now) {
+  var cutoff = now - RATE_LIMIT_WINDOW_MS * 2;
+  state.hits.forEach(function (entry, key) {
+    if (!entry || entry.windowStart < cutoff) state.hits.delete(key);
+  });
+}
+
+function checkRateLimit(ip, now) {
+  var rec = state.hits.get(ip);
+  if (!rec || now - rec.windowStart >= RATE_LIMIT_WINDOW_MS) rec = { windowStart: now, count: 0 };
+  rec.count += 1;
+  state.hits.set(ip, rec);
+  if (rec.count <= RATE_LIMIT_MAX_REQUESTS) return null;
+  var retryAfterMs = Math.max(1000, RATE_LIMIT_WINDOW_MS - (now - rec.windowStart));
+  return {
+    retryAfterSec: Math.ceil(retryAfterMs / 1000),
+    limit: RATE_LIMIT_MAX_REQUESTS,
+    windowMs: RATE_LIMIT_WINDOW_MS,
+  };
+}
 
 async function fetchWithTimeout(url, options, timeoutMs) {
   var controller = new AbortController();
@@ -162,13 +213,16 @@ async function btcLabFetch(category, field) {
     var last = data[data.length - 1];
     var val = null;
     if (Array.isArray(last)) val = parseFloat(last[last.length - 1]);
-    else if (typeof last === "object") val = parseFloat(last.value || last[field] || last[Object.keys(last).pop()]);
+    else if (typeof last === "object") {
+      var objVal = firstDefined(last.value, last[field], last[Object.keys(last).pop()]);
+      val = parseFloat(objVal);
+    }
     else val = parseFloat(last);
     if (!isNaN(val)) return round2(val);
   }
   // Maybe it's a single object with the value directly
   if (json && typeof json === "object" && !Array.isArray(json)) {
-    var v = json.value || json[field] || json.latest;
+    var v = firstDefined(json.value, json[field], json.latest);
     if (v != null) return round2(parseFloat(v));
   }
   throw new Error("BtcLab " + field + " no parseable data");
@@ -282,88 +336,136 @@ async function fetchCAPE() {
 
 // ── Handler ──
 
+async function fetchNUPLWithFallback() {
+  try {
+    return await fetchNUPLFromCQ();
+  } catch (e1) {
+    try {
+      return await fetchNUPL();
+    } catch (e2) {
+      throw new Error("CQ=" + errorMessage(e1) + " | BtcLab=" + errorMessage(e2));
+    }
+  }
+}
+
+function applySettled(result, label, warnings, onSuccess) {
+  if (result.status === "fulfilled") {
+    onSuccess(result.value);
+    return;
+  }
+  warnings.push(label + ": " + errorMessage(result.reason));
+}
+
+async function buildMarketPayload() {
+  var output = {};
+  var warnings = [];
+
+  var spxP = fetchSPX();
+  var spxRsiP = fetchSPXRsi();
+  var goldP = fetchGold();
+  var goldRsiP = fetchGoldRsi();
+  var vixP = fetchVIX();
+  var silverP = fetchSilver();
+  var btcP = fetchBTC();
+  var fgP = fetchFG();
+  var mvrvP = fetchMVRV();
+  var nuplP = fetchNUPLWithFallback();
+  var capeP = fetchCAPE();
+
+  var results = await Promise.allSettled([
+    spxP, spxRsiP, goldP, goldRsiP, vixP, silverP, btcP, fgP, mvrvP, nuplP, capeP,
+  ]);
+
+  var spxRes = results[0];
+  var spxRsiRes = results[1];
+  var goldRes = results[2];
+  var goldRsiRes = results[3];
+  var vixRes = results[4];
+  var silverRes = results[5];
+  var btcRes = results[6];
+  var fgRes = results[7];
+  var mvrvRes = results[8];
+  var nuplRes = results[9];
+  var capeRes = results[10];
+
+  applySettled(spxRes, "SPX", warnings, function (v) { Object.assign(output, v); });
+  applySettled(spxRsiRes, "SPX RSI", warnings, function (v) { output.spxRsi = v; });
+  applySettled(goldRes, "Gold", warnings, function (v) { Object.assign(output, v); });
+  applySettled(goldRsiRes, "Gold RSI", warnings, function (v) { output.goldRsi = v; });
+  applySettled(vixRes, "VIX", warnings, function (v) { output.vix = v; });
+  applySettled(btcRes, "BTC", warnings, function (v) { Object.assign(output, v); });
+  applySettled(fgRes, "F&G", warnings, function (v) { if (v != null) output.cryptoFG = v; });
+  applySettled(mvrvRes, "MVRV", warnings, function (v) { output.mvrv = v; });
+  applySettled(nuplRes, "NUPL", warnings, function (v) { output.nupl = v; });
+  applySettled(capeRes, "CAPE", warnings, function (v) { output.cape = v; });
+
+  if (goldRes.status === "fulfilled" && silverRes.status === "fulfilled") {
+    var gold = goldRes.value && goldRes.value.currentGOLD;
+    var silver = silverRes.value;
+    if (gold && silver > 0) output.gsRatio = round2(gold / silver);
+  } else if (silverRes.status === "rejected") {
+    warnings.push("Au/Ag: " + errorMessage(silverRes.reason));
+  }
+
+  output.timestamp = new Date().toISOString();
+  if (warnings.length > 0) output.warnings = warnings;
+  return output;
+}
+
 export default async function handler(req, res) {
   var origin = req.headers.origin || "";
   var allowed = isAllowedOrigin(origin);
+
   res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Origin", allowed ? origin : "https://regimeiq.com");
+  res.setHeader("Access-Control-Allow-Origin", allowed ? origin : DEFAULT_ALLOWED_ORIGIN);
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Max-Age", "86400");
   res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=600");
-  if (req.method === "OPTIONS") { res.status(204).end(); return; }
+
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
   if (req.method !== "GET") {
     res.setHeader("Allow", "GET, OPTIONS");
     res.status(405).json({ error: "Method not allowed" });
     return;
   }
-
-  var output = {};
-  var warnings = [];
-
-  // SPX via SPY (EODHD)
-  try {
-    Object.assign(output, await fetchSPX());
-  } catch (e) { warnings.push("SPX: " + e.message); }
-
-  // SPX Monthly RSI (Alpha Vantage)
-  try {
-    output.spxRsi = await fetchSPXRsi();
-  } catch (e) { warnings.push("SPX RSI: " + e.message); }
-
-  // Gold (EODHD)
-  try {
-    Object.assign(output, await fetchGold());
-  } catch (e) { warnings.push("Gold: " + e.message); }
-
-  // Gold Monthly RSI (Alpha Vantage — GLD ETF)
-  try {
-    output.goldRsi = await fetchGoldRsi();
-  } catch (e) { warnings.push("Gold RSI: " + e.message); }
-
-  // VIX (EODHD)
-  try {
-    output.vix = await fetchVIX();
-  } catch (e) { warnings.push("VIX: " + e.message); }
-
-  // Au/Ag ratio (EODHD silver + gold already fetched)
-  try {
-    var silverPrice = await fetchSilver();
-    if (output.currentGOLD && silverPrice > 0) {
-      output.gsRatio = round2(output.currentGOLD / silverPrice);
-    }
-  } catch (e) { warnings.push("Au/Ag: " + e.message); }
-
-  // BTC (CoinGecko)
-  try {
-    Object.assign(output, await fetchBTC());
-  } catch (e) { warnings.push("BTC: " + e.message); }
-
-  // Crypto F&G (alternative.me)
-  try {
-    var fg = await fetchFG();
-    if (fg != null) output.cryptoFG = fg;
-  } catch (e) { warnings.push("F&G: " + e.message); }
-
-  // MVRV Z-Score (Bitcoin Lab)
-  try {
-    output.mvrv = await fetchMVRV();
-  } catch (e) { warnings.push("MVRV: " + e.message); }
-
-  // NUPL (CryptoQuant primary → Bitcoin Lab fallback)
-  try {
-    output.nupl = await fetchNUPLFromCQ();
-  } catch (e1) {
-    try { output.nupl = await fetchNUPL(); }
-    catch (e2) { warnings.push("NUPL: CQ=" + e1.message + " | BtcLab=" + e2.message); }
+  if (origin && !allowed) {
+    res.status(403).json({ error: "Origin not allowed" });
+    return;
   }
 
-  // Shiller CAPE (NASDAQ Data Link)
+  var now = Date.now();
+  pruneRateLimitState(now);
+  var ip = getClientIp(req);
+  var limited = checkRateLimit(ip, now);
+  if (limited) {
+    res.setHeader("Retry-After", String(limited.retryAfterSec));
+    res.status(429).json({
+      error: "Rate limit exceeded",
+      limit: limited.limit,
+      windowMs: limited.windowMs,
+    });
+    return;
+  }
+
+  if (state.cache && now - state.cache.ts < MEMORY_CACHE_TTL_MS) {
+    res.setHeader("X-Cache", "HIT");
+    res.status(200).json(state.cache.payload);
+    return;
+  }
+
   try {
-    output.cape = await fetchCAPE();
-  } catch (e) { warnings.push("CAPE: " + e.message); }
-
-  output.timestamp = new Date().toISOString();
-  if (warnings.length > 0) output.warnings = warnings;
-
-  res.status(200).json(output);
+    if (!state.inflight) state.inflight = buildMarketPayload();
+    var payload = await state.inflight;
+    state.cache = { ts: Date.now(), payload: payload };
+    res.setHeader("X-Cache", "MISS");
+    res.status(200).json(payload);
+  } catch (err) {
+    res.status(502).json({ error: "Upstream fetch failed", detail: errorMessage(err) });
+  } finally {
+    state.inflight = null;
+  }
 }

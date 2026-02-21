@@ -66,7 +66,7 @@ function numOrNull(v) {
 function calcDrawdown(high, current) {
   var h = num(high), c = num(current);
   if (h === 0) return 0;
-  return ((h - c) / h) * 100;
+  return Math.max(0, ((h - c) / h) * 100);
 }
 function getActiveTiers(dd, tiers) { return tiers.filter(function (t) { return dd >= t.drop; }); }
 function getCumulativePct(active) { return active.reduce(function (s, t) { return s + t.pct; }, 0); }

@@ -131,6 +131,7 @@ API keys required in `.env`:
 EODHD_KEY=
 ALPHA_VANTAGE_KEY=
 BTCLAB_KEY=
+CRYPTOQUANT_KEY=
 ```
 
 ## License
